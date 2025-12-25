@@ -1,131 +1,779 @@
 <script setup>
-import { ref } from "vue";
+import { ref, onMounted, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 
-const greetMsg = ref("");
-const name = ref("");
+const tasks = ref([]);
+const ffmpegStatus = ref("Checking...");
+const gpuAccel = ref(false);
+const gpuInfo = ref({ has_nvenc: false, has_videotoolbox: false, has_amf: false, has_qsv: false });
+const activeTab = ref('video');
+const selectedTaskId = ref(null);
+const isProcessing = ref(false);
+const showDetails = ref(false);
+const detailsTask = ref(null);
 
-async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg.value = await invoke("greet", { name: name.value });
-}
+const selectedTask = computed(() => tasks.value.find(t => t.id === selectedTaskId.value));
+
+const globalProgress = computed(() => {
+  if (tasks.value.length === 0) return 0;
+  const total = tasks.value.reduce((acc, t) => acc + (t.progress || 0), 0);
+  return Math.round(total / tasks.value.length);
+});
+
+const settings = ref({
+  video: {
+    codec: 'libx264',
+    accel: 'cpu',
+    mode: 'crf',
+    crf: 23,
+    bitrate: '2000k',
+    preset: 'medium'
+  },
+  audio: {
+    stream: 'copy',
+    codec: 'aac',
+    bitrate: '128k'
+  },
+  advanced: {
+    resolution: 'original',
+    trimStart: '',
+    trimEnd: ''
+  },
+  output: {
+    dir: '',
+    suffix: '_out'
+  }
+});
+
+const formatSize = (bytes) => {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+const formatDuration = (seconds) => {
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  return [h, m, s].map(v => v.toString().padStart(2, '0')).join(':');
+};
+
+const formatBitrate = (bitrate) => {
+  const b = parseInt(bitrate);
+  if (isNaN(b) || b === 0) return 'N/A';
+  if (b < 1000) return b + ' bps';
+  if (b < 1000000) return (b / 1000).toFixed(1) + ' kbps';
+  return (b / 1000000).toFixed(1) + ' Mbps';
+};
+
+const openDetails = (task) => {
+  detailsTask.value = task;
+  showDetails.value = true;
+};
+
+const processFiles = async (paths) => {
+  for (const path of paths) {
+    const name = path.split(/[\\/]/).pop();
+    const id = Math.random().toString(36).substring(7);
+
+    const newTask = {
+      id,
+      name,
+      path,
+      status: 'loading',
+      progress: 0,
+      resolution: '...',
+      size: '...',
+      duration: '...',
+      rawDuration: 0,
+      details: null
+    };
+    tasks.value.push(newTask);
+    if (!selectedTaskId.value) selectedTaskId.value = id;
+
+    try {
+      const info = await invoke("get_video_info", { path });
+      // Find the task in the array to ensure reactivity
+      const taskIndex = tasks.value.findIndex(t => t.id === id);
+      if (taskIndex !== -1) {
+        tasks.value[taskIndex] = {
+          ...tasks.value[taskIndex],
+          resolution: `${info.width}x${info.height}`,
+          size: formatSize(info.size),
+          duration: formatDuration(info.duration),
+          rawDuration: info.duration,
+          details: info,
+          status: 'waiting'
+        };
+      }
+    } catch (e) {
+      console.error("Failed to get video info:", e);
+      const taskIndex = tasks.value.findIndex(t => t.id === id);
+      if (taskIndex !== -1) {
+        tasks.value[taskIndex].status = 'error';
+      }
+    }
+  }
+};
+
+onMounted(async () => {
+  try {
+    const info = await invoke("check_ffmpeg");
+    if (info.is_available) {
+      ffmpegStatus.value = `Ready (${info.version.split(' ')[2] || 'v?'})`;
+    } else {
+      ffmpegStatus.value = "Not Found";
+    }
+
+    const gpu = await invoke("check_gpu_accel");
+    gpuInfo.value = gpu;
+    gpuAccel.value = gpu.has_nvenc || gpu.has_videotoolbox || gpu.has_amf || gpu.has_qsv;
+  } catch (e) {
+    console.error("Failed to check ffmpeg:", e);
+    ffmpegStatus.value = "Error";
+  }
+
+  // Listen for file drops
+  await getCurrentWindow().onDragDropEvent((event) => {
+    if (event.payload.type === 'drop') {
+      processFiles(event.payload.paths);
+    }
+  });
+
+  // Listen for progress
+  await listen("task-progress", (event) => {
+    const { task_id, progress, status } = event.payload;
+    const task = tasks.value.find(t => t.id === task_id);
+    if (task) {
+      if (progress >= 0) task.progress = progress;
+      task.status = status;
+    }
+  });
+});
+
+const addFiles = async () => {
+  const selected = await open({
+    multiple: true,
+    filters: [{
+      name: 'Video',
+      extensions: ['mp4', 'mkv', 'avi', 'mov', 'flv', 'wmv']
+    }]
+  });
+  if (selected) {
+    processFiles(Array.isArray(selected) ? selected : [selected]);
+  }
+};
+
+const selectOutputDir = async () => {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+  });
+  if (selected) {
+    settings.value.output.dir = selected;
+  }
+};
+
+const startAll = async () => {
+  if (isProcessing.value) return;
+  isProcessing.value = true;
+
+  for (const task of tasks.value) {
+    if (task.status === 'waiting' || task.status === 'error') {
+      try {
+        // Convert settings to snake_case for Rust
+        const rustSettings = {
+          video: { ...settings.value.video, crf: parseInt(settings.value.video.crf) },
+          audio: { ...settings.value.audio },
+          advanced: {
+            resolution: settings.value.advanced.resolution,
+            trim_start: settings.value.advanced.trimStart,
+            trim_end: settings.value.advanced.trimEnd
+          },
+          output: { ...settings.value.output }
+        };
+
+        await invoke("run_task", {
+          taskId: task.id,
+          inputPath: task.path,
+          duration: task.rawDuration,
+          settings: rustSettings
+        });
+      } catch (e) {
+        console.error(`Task ${task.id} failed:`, e);
+        task.status = 'error';
+      }
+    }
+  }
+  isProcessing.value = false;
+};
+
+const clearTasks = () => {
+  if (isProcessing.value) return;
+  tasks.value = [];
+  selectedTaskId.value = null;
+};
+
+const removeTask = (id) => {
+  if (isProcessing.value) return;
+  tasks.value = tasks.value.filter(t => t.id !== id);
+  if (selectedTaskId.value === id) {
+    selectedTaskId.value = tasks.value[0]?.id || null;
+  }
+};
 </script>
 
 <template>
-  <main class="container">
-    <h1>Welcome to Tauri + Vue</h1>
-
-    <div class="row">
-      <a href="https://vite.dev" target="_blank">
-        <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-      </a>
-      <a href="https://tauri.app" target="_blank">
-        <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-      </a>
-      <a href="https://vuejs.org/" target="_blank">
-        <img src="./assets/vue.svg" class="logo vue" alt="Vue logo" />
-      </a>
+  <div class="app-container">
+    <!-- 左侧：任务管理区 -->
+    <div class="left-panel">
+      <div class="panel-header">任务列表</div>
+      <div class="task-list" v-if="tasks.length > 0">
+        <div v-for="task in tasks" :key="task.id" class="task-card" :class="{ active: selectedTaskId === task.id }"
+          @click="selectedTaskId = task.id">
+          <div class="task-info">
+            <div class="task-name">{{ task.name }}</div>
+            <div class="task-meta">
+              {{ task.resolution }} | {{ task.size }}
+              <span v-if="task.details" class="btn-details" @click.stop="openDetails(task)">[详情]</span>
+            </div>
+          </div>
+          <div class="task-status">
+            <span v-if="task.status === 'waiting'" @click.stop="removeTask(task.id)" class="btn-remove">✕</span>
+            <div v-else-if="task.status === 'processing'" class="mini-progress">
+              <div class="progress-bar" :style="{ width: task.progress + '%' }"></div>
+            </div>
+            <span v-else-if="task.status === 'done'">✅</span>
+            <span v-else-if="task.status === 'error'">❌</span>
+          </div>
+        </div>
+      </div>
+      <div class="drop-zone" @click="addFiles" v-else>
+        <div class="plus-icon">+</div>
+        <div>拖入视频文件或点击添加</div>
+      </div>
     </div>
-    <p>Click on the Tauri, Vite, and Vue logos to learn more.</p>
 
-    <form class="row" @submit.prevent="greet">
-      <input id="greet-input" v-model="name" placeholder="Enter a name..." />
-      <button type="submit">Greet</button>
-    </form>
-    <p>{{ greetMsg }}</p>
-  </main>
+    <!-- 右侧：参数配置区 -->
+    <div class="right-panel">
+      <div class="panel-header">
+        编码设置
+        <span v-if="selectedTask" class="selected-info">
+          - {{ selectedTask.name }} ({{ selectedTask.resolution }}, {{ selectedTask.duration }})
+        </span>
+      </div>
+
+      <div class="tabs">
+        <button :class="{ active: activeTab === 'video' }" @click="activeTab = 'video'">视频</button>
+        <button :class="{ active: activeTab === 'audio' }" @click="activeTab = 'audio'">音频</button>
+        <button :class="{ active: activeTab === 'advanced' }" @click="activeTab = 'advanced'">高级</button>
+        <button :class="{ active: activeTab === 'output' }" @click="activeTab = 'output'">输出</button>
+      </div>
+
+      <div class="config-content">
+        <div v-if="activeTab === 'video'" class="config-section">
+          <div class="form-item">
+            <label>编码器</label>
+            <select v-model="settings.video.codec">
+              <option value="libx264">H.264 (AVC)</option>
+              <option value="libx265">H.265 (HEVC)</option>
+              <option value="libsvtav1">AV1</option>
+            </select>
+          </div>
+          <div class="form-item">
+            <label>硬件加速</label>
+            <select v-model="settings.video.accel">
+              <option value="cpu">CPU (Software)</option>
+              <option v-if="gpuInfo.has_nvenc" value="nvenc">NVIDIA NVENC</option>
+              <option v-if="gpuInfo.has_videotoolbox" value="videotoolbox">Apple VideoToolbox</option>
+              <option v-if="gpuInfo.has_amf" value="amf">AMD AMF</option>
+              <option v-if="gpuInfo.has_qsv" value="qsv">Intel QSV</option>
+            </select>
+          </div>
+          <div class="form-item">
+            <label>质量控制</label>
+            <div class="radio-group">
+              <label><input type="radio" value="crf" v-model="settings.video.mode"> CRF</label>
+              <label><input type="radio" value="bitrate" v-model="settings.video.mode"> 码率</label>
+            </div>
+          </div>
+          <div class="form-item" v-if="settings.video.mode === 'crf'">
+            <label>CRF 值 (越小质量越高)</label>
+            <div class="slider-container">
+              <input type="range" min="0" max="51" v-model="settings.video.crf">
+              <span>{{ settings.video.crf }}</span>
+            </div>
+          </div>
+          <div class="form-item" v-else>
+            <label>目标码率 (例如: 2000k)</label>
+            <input type="text" v-model="settings.video.bitrate">
+          </div>
+          <div class="form-item">
+            <label>预设速度 (Preset)</label>
+            <select v-model="settings.video.preset">
+              <option value="ultrafast">Ultrafast</option>
+              <option value="superfast">Superfast</option>
+              <option value="veryfast">Veryfast</option>
+              <option value="faster">Faster</option>
+              <option value="fast">Fast</option>
+              <option value="medium">Medium</option>
+              <option value="slow">Slow</option>
+              <option value="slower">Slower</option>
+              <option value="veryslow">Veryslow</option>
+            </select>
+          </div>
+        </div>
+
+        <div v-if="activeTab === 'audio'" class="config-section">
+          <div class="form-item">
+            <label>音频流处理</label>
+            <select v-model="settings.audio.stream">
+              <option value="copy">复制 (Copy)</option>
+              <option value="none">移除 (None)</option>
+              <option value="encode">重新编码</option>
+            </select>
+          </div>
+          <template v-if="settings.audio.stream === 'encode'">
+            <div class="form-item">
+              <label>音频编码器</label>
+              <select v-model="settings.audio.codec">
+                <option value="aac">AAC</option>
+                <option value="libmp3lame">MP3</option>
+                <option value="opus">Opus</option>
+              </select>
+            </div>
+            <div class="form-item">
+              <label>音频码率</label>
+              <select v-model="settings.audio.bitrate">
+                <option value="128k">128k</option>
+                <option value="192k">192k</option>
+                <option value="256k">256k</option>
+                <option value="320k">320k</option>
+              </select>
+            </div>
+          </template>
+        </div>
+
+        <div v-if="activeTab === 'advanced'" class="config-section">
+          <div class="form-item">
+            <label>分辨率缩放</label>
+            <select v-model="settings.advanced.resolution">
+              <option value="original">原始分辨率</option>
+              <option value="1920:1080">1920x1080 (1080p)</option>
+              <option value="1280:720">1280x720 (720p)</option>
+              <option value="854:480">854x480 (480p)</option>
+            </select>
+          </div>
+          <div class="form-item">
+            <label>裁剪 (Trim)</label>
+            <div class="input-with-btn">
+              <input type="text" v-model="settings.advanced.trimStart" placeholder="开始时间 (00:00:00)">
+              <span>至</span>
+              <input type="text" v-model="settings.advanced.trimEnd" placeholder="结束时间">
+            </div>
+          </div>
+        </div>
+
+        <div v-if="activeTab === 'output'" class="config-section">
+          <div class="form-item">
+            <label>输出目录</label>
+            <div class="input-with-btn">
+              <input type="text" v-model="settings.output.dir" placeholder="默认：原文件夹/out">
+              <button @click="selectOutputDir">选择</button>
+            </div>
+          </div>
+          <div class="form-item">
+            <label>文件名后缀</label>
+            <input type="text" v-model="settings.output.suffix">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 底部：执行与状态 -->
+    <div class="bottom-bar">
+      <div class="status-info">
+        <span class="status-dot" :class="{ ready: ffmpegStatus.includes('Ready') }"></span>
+        FFmpeg: {{ ffmpegStatus }} | GPU Accel: {{ gpuAccel ? 'On' : 'Off' }}
+      </div>
+      <div class="global-progress">
+        <div class="progress-text">总进度: {{ globalProgress }}%</div>
+        <div class="progress-track">
+          <div class="progress-fill" :style="{ width: globalProgress + '%' }"></div>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn-clear" @click="clearTasks" :disabled="isProcessing">清空列表</button>
+        <button class="btn-start" @click="startAll" :disabled="isProcessing || tasks.length === 0">
+          {{ isProcessing ? '处理中...' : '立即开始' }}
+        </button>
+      </div>
+    </div>
+
+    <!-- 详情模态框 -->
+    <div v-if="showDetails" class="modal-overlay" @click="showDetails = false">
+      <div class="modal-content" @click.stop>
+        <div class="modal-header">
+          <h3>视频详细参数</h3>
+          <button class="btn-close" @click="showDetails = false">✕</button>
+        </div>
+        <div class="modal-body" v-if="detailsTask && detailsTask.details">
+          <div class="detail-item">
+            <label>文件名:</label>
+            <span>{{ detailsTask.name }}</span>
+          </div>
+          <div class="detail-item">
+            <label>路径:</label>
+            <span class="path-text">{{ detailsTask.path }}</span>
+          </div>
+          <div class="detail-grid">
+            <div class="detail-item">
+              <label>分辨率:</label>
+              <span>{{ detailsTask.details.width }} x {{ detailsTask.details.height }}</span>
+            </div>
+            <div class="detail-item">
+              <label>时长:</label>
+              <span>{{ detailsTask.duration }}</span>
+            </div>
+            <div class="detail-item">
+              <label>文件大小:</label>
+              <span>{{ detailsTask.size }}</span>
+            </div>
+            <div class="detail-item">
+              <label>封装格式:</label>
+              <span>{{ detailsTask.details.format }}</span>
+            </div>
+            <div class="detail-item">
+              <label>视频编码:</label>
+              <span>{{ detailsTask.details.video_codec }}</span>
+            </div>
+            <div class="detail-item">
+              <label>视频码率:</label>
+              <span>{{ formatBitrate(detailsTask.details.video_bitrate) }}</span>
+            </div>
+            <div class="detail-item">
+              <label>帧率:</label>
+              <span>{{ detailsTask.details.frame_rate }} fps</span>
+            </div>
+            <div class="detail-item">
+              <label>音频编码:</label>
+              <span>{{ detailsTask.details.audio_codec }}</span>
+            </div>
+            <div class="detail-item">
+              <label>音频码率:</label>
+              <span>{{ formatBitrate(detailsTask.details.audio_bitrate) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 </template>
 
-<style scoped>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.vue:hover {
-  filter: drop-shadow(0 0 2em #249b73);
-}
-
-</style>
 <style>
 :root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
-
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
+  --bg-color: #f5f5f7;
+  --panel-bg: #ffffff;
+  --border-color: #e0e0e0;
+  --primary-color: #007aff;
+  --text-color: #333;
+  --text-secondary: #666;
 }
 
-.container {
+body {
   margin: 0;
-  padding-top: 10vh;
+  padding: 0;
+  overflow: hidden;
+}
+
+.app-container {
+  display: grid;
+  grid-template-columns: 40% 60%;
+  grid-template-rows: 1fr 60px;
+  height: 100vh;
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+.left-panel {
+  border-right: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  text-align: center;
+  background-color: var(--panel-bg);
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
+.right-panel {
   display: flex;
+  flex-direction: column;
+  background-color: var(--panel-bg);
+}
+
+.panel-header {
+  padding: 15px;
+  font-weight: bold;
+  border-bottom: 1px solid var(--border-color);
+  background-color: #fafafa;
+}
+
+.drop-zone {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   justify-content: center;
+  border: 2px dashed var(--border-color);
+  margin: 20px;
+  border-radius: 8px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.3s;
 }
 
-a {
+.drop-zone:hover {
+  border-color: var(--primary-color);
+  background-color: rgba(0, 122, 255, 0.05);
+}
+
+.plus-icon {
+  font-size: 48px;
+  margin-bottom: 10px;
+}
+
+.bottom-bar {
+  grid-column: span 2;
+  background-color: #fff;
+  border-top: 1px solid var(--border-color);
+  display: flex;
+  align-items: center;
+  padding: 0 20px;
+  gap: 20px;
+}
+
+.status-info {
+  display: flex;
+  align-items: center;
+  font-size: 12px;
+  min-width: 200px;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: #ccc;
+  margin-right: 8px;
+}
+
+.status-dot.ready {
+  background-color: #4cd964;
+}
+
+.global-progress {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.progress-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.progress-track {
+  height: 6px;
+  background-color: #eee;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background-color: var(--primary-color);
+  transition: width 0.3s;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+}
+
+button {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: #fff;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.btn-start {
+  background-color: var(--primary-color);
+  color: white;
+  border: none;
+}
+
+.btn-start:hover {
+  background-color: #0062cc;
+}
+
+.tabs {
+  display: flex;
+  padding: 10px;
+  gap: 5px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.tabs button {
+  flex: 1;
+  border: none;
+  background: none;
+  padding: 8px;
+  border-radius: 4px;
+}
+
+.tabs button.active {
+  background-color: #eee;
+  font-weight: bold;
+}
+
+.config-content {
+  padding: 20px;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.config-section {
+  display: flex;
+  flex-direction: column;
+  gap: 15px;
+}
+
+.form-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.form-item label {
+  font-size: 13px;
   font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
+  color: var(--text-secondary);
 }
 
-a:hover {
-  color: #535bf2;
+select,
+input[type="text"] {
+  padding: 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
 }
 
+.radio-group {
+  display: flex;
+  gap: 15px;
+}
+
+.input-with-btn {
+  display: flex;
+  gap: 5px;
+}
+
+.input-with-btn input {
+  flex: 1;
+}
+
+.task-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px;
+}
+
+.task-card {
+  background: #fff;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 10px;
+  margin-bottom: 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.task-name {
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 4px;
+}
+
+.task-meta {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-details {
+  color: var(--primary-color);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.btn-details:hover {
+  text-decoration: underline;
+}
+
+.mini-progress {
+  width: 60px;
+  height: 4px;
+  background: #eee;
+  border-radius: 2px;
+}
+
+.btn-remove {
+  cursor: pointer;
+  color: #999;
+  padding: 5px;
+  border-radius: 50%;
+  transition: all 0.2s;
+}
+
+.btn-remove:hover {
+  color: #ff3b30;
+  background-color: rgba(255, 59, 48, 0.1);
+}
+
+.task-card.active {
+  border-color: var(--primary-color);
+  background-color: rgba(0, 122, 255, 0.02);
+}
+
+.selected-info {
+  font-weight: normal;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-left: 10px;
+}
+
+.slider-container {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.slider-container input {
+  flex: 1;
+}
+
+/* 全局基础样式 */
 h1 {
   text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
-  cursor: pointer;
-}
-
-button:hover {
-  border-color: #396cd8;
-}
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
 }
 
 input,
@@ -133,28 +781,128 @@ button {
   outline: none;
 }
 
-#greet-input {
-  margin-right: 5px;
-}
-
 @media (prefers-color-scheme: dark) {
   :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
+    --bg-color: #1a1a1a;
+    --panel-bg: #2c2c2c;
+    --border-color: #444;
+    --text-color: #e0e0e0;
+    --text-secondary: #aaa;
   }
 
-  a:hover {
-    color: #24c8db;
+  .panel-header {
+    background-color: #333;
   }
 
-  input,
+  .tabs button.active {
+    background-color: #444;
+  }
+
+  .task-card {
+    background: #333;
+  }
+
+  .bottom-bar {
+    background-color: #2c2c2c;
+  }
+
+  select,
+  input[type="text"] {
+    background-color: #333;
+    color: #e0e0e0;
+    border-color: #555;
+  }
+
   button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
+    background-color: #444;
+    color: #e0e0e0;
+    border-color: #555;
   }
-  button:active {
-    background-color: #0f0f0f69;
+
+  .btn-start {
+    background-color: var(--primary-color);
+    color: white;
   }
 }
 
+/* 模态框样式 */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.modal-content {
+  background: var(--panel-bg);
+  width: 500px;
+  max-width: 90%;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+  overflow: hidden;
+}
+
+.modal-header {
+  padding: 15px 20px;
+  border-bottom: 1px solid var(--border-color);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.modal-header h3 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.btn-close {
+  background: none;
+  border: none;
+  font-size: 18px;
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+.modal-body {
+  padding: 20px;
+}
+
+.detail-item {
+  margin-bottom: 12px;
+}
+
+.detail-item label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 2px;
+}
+
+.detail-item span {
+  font-size: 14px;
+  word-break: break-all;
+}
+
+.path-text {
+  font-family: monospace;
+  font-size: 12px !important;
+  background: rgba(0, 0, 0, 0.05);
+  padding: 4px;
+  border-radius: 4px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 15px;
+  margin-top: 10px;
+  padding-top: 15px;
+  border-top: 1px solid var(--border-color);
+}
 </style>
