@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed } from "vue";
+import { ref, onMounted, computed, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -16,6 +16,13 @@ const showDetails = ref(false);
 const detailsTask = ref(null);
 
 const selectedTask = computed(() => tasks.value.find(t => t.id === selectedTaskId.value));
+
+// 当选中任务改变时，如果是音频文件且当前在视频选项卡，则自动切换到音频选项卡
+watch(selectedTask, (newTask) => {
+  if (newTask && newTask.resolution === '音频文件' && activeTab.value === 'video') {
+    activeTab.value = 'audio';
+  }
+});
 
 const globalProgress = computed(() => {
   if (tasks.value.length === 0) return 0;
@@ -35,7 +42,9 @@ const settings = ref({
   audio: {
     stream: 'copy',
     codec: 'aac',
-    bitrate: '128k'
+    bitrate: '128k',
+    sample_rate: '',
+    channels: ''
   },
   advanced: {
     resolution: 'original',
@@ -128,9 +137,11 @@ const processFiles = async (paths) => {
       // Find the task in the array to ensure reactivity
       const taskIndex = tasks.value.findIndex(t => t.id === id);
       if (taskIndex !== -1) {
+        // Determine if it's an audio-only file
+        const isAudioOnly = info.video_codec === 'none' || (info.width === 0 && info.height === 0);
         tasks.value[taskIndex] = {
           ...tasks.value[taskIndex],
-          resolution: `${info.width}x${info.height}`,
+          resolution: isAudioOnly ? '音频文件' : `${info.width}x${info.height}`,
           size: formatSize(info.size),
           duration: formatDuration(info.duration),
           rawDuration: info.duration,
@@ -187,8 +198,8 @@ const addFiles = async () => {
   const selected = await open({
     multiple: true,
     filters: [{
-      name: 'Video',
-      extensions: ['mp4', 'mkv', 'avi', 'mov', 'flv', 'wmv']
+      name: 'Media',
+      extensions: ['mp4', 'mkv', 'avi', 'mov', 'flv', 'wmv', 'mp3', 'flac', 'wav', 'm4a', 'aac', 'ogg']
     }]
   });
   if (selected) {
@@ -268,7 +279,9 @@ const removeTask = (id) => {
           <div class="task-info">
             <div class="task-name">{{ task.name }}</div>
             <div class="task-meta">
-              {{ task.resolution }} | {{ task.size }}
+              <span v-if="task.resolution === '音频文件'">🎵 音频文件</span>
+              <span v-else>{{ task.resolution }}</span>
+              | {{ task.size }}
               <span v-if="task.details" class="btn-details" @click.stop="openDetails(task)">[详情]</span>
             </div>
           </div>
@@ -293,12 +306,19 @@ const removeTask = (id) => {
       <div class="panel-header">
         编码设置
         <span v-if="selectedTask" class="selected-info">
-          - {{ selectedTask.name }} ({{ selectedTask.resolution }}, {{ selectedTask.duration }})
+          - {{ selectedTask.name }}
+          <template v-if="selectedTask.resolution === '音频文件'">
+            (音频文件, {{ selectedTask.duration }})
+          </template>
+          <template v-else>
+            ({{ selectedTask.resolution }}, {{ selectedTask.duration }})
+          </template>
         </span>
       </div>
 
       <div class="tabs">
-        <button :class="{ active: activeTab === 'video' }" @click="activeTab = 'video'">视频</button>
+        <button :class="{ active: activeTab === 'video', disabled: selectedTask && selectedTask.resolution === '音频文件' }"
+                @click="selectedTask && selectedTask.resolution === '音频文件' ? null : activeTab = 'video'">视频</button>
         <button :class="{ active: activeTab === 'audio' }" @click="activeTab = 'audio'">音频</button>
         <button :class="{ active: activeTab === 'advanced' }" @click="activeTab = 'advanced'">高级</button>
         <button :class="{ active: activeTab === 'output' }" @click="activeTab = 'output'">输出</button>
@@ -374,15 +394,40 @@ const removeTask = (id) => {
                 <option value="aac">AAC</option>
                 <option value="libmp3lame">MP3</option>
                 <option value="opus">Opus</option>
+                <option value="flac">FLAC</option>
+                <option value="libvorbis">Vorbis</option>
+                <option value="pcm_s16le">WAV (PCM)</option>
               </select>
             </div>
             <div class="form-item">
               <label>音频码率</label>
               <select v-model="settings.audio.bitrate">
+                <option value="64k">64k</option>
+                <option value="96k">96k</option>
                 <option value="128k">128k</option>
+                <option value="160k">160k</option>
                 <option value="192k">192k</option>
                 <option value="256k">256k</option>
                 <option value="320k">320k</option>
+              </select>
+            </div>
+            <div class="form-item">
+              <label>采样率</label>
+              <select v-model="settings.audio.sample_rate">
+                <option value="">默认</option>
+                <option value="22050">22050 Hz</option>
+                <option value="44100">44100 Hz</option>
+                <option value="48000">48000 Hz</option>
+                <option value="96000">96000 Hz</option>
+              </select>
+            </div>
+            <div class="form-item">
+              <label>声道数</label>
+              <select v-model="settings.audio.channels">
+                <option value="">默认</option>
+                <option value="1">单声道 (Mono)</option>
+                <option value="2">立体声 (Stereo)</option>
+                <option value="6">5.1声道</option>
               </select>
             </div>
           </template>
@@ -519,6 +564,14 @@ const removeTask = (id) => {
             <div class="detail-item">
               <label>音频码率:</label>
               <span>{{ formatBitrate(detailsTask.details.audio_bitrate) }}</span>
+            </div>
+            <div class="detail-item">
+              <label>音频采样率:</label>
+              <span>{{ detailsTask.details.audio_sample_rate }} Hz</span>
+            </div>
+            <div class="detail-item">
+              <label>音频声道数:</label>
+              <span>{{ detailsTask.details.audio_channels }}</span>
             </div>
           </div>
         </div>
@@ -693,6 +746,12 @@ button {
 .tabs button.active {
   background-color: #eee;
   font-weight: bold;
+}
+
+.tabs button.disabled {
+  color: #999;
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .config-content {

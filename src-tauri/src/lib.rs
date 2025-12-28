@@ -72,6 +72,8 @@ pub struct VideoInfo {
     video_bitrate: String,
     audio_codec: String,
     audio_bitrate: String,
+    audio_sample_rate: String,
+    audio_channels: String,
     frame_rate: String,
 }
 
@@ -113,6 +115,8 @@ async fn get_video_info(path: String) -> Result<VideoInfo, String> {
         video_bitrate: "0".to_string(),
         audio_codec: "none".to_string(),
         audio_bitrate: "0".to_string(),
+        audio_sample_rate: "0".to_string(),
+        audio_channels: "0".to_string(),
         frame_rate: "0".to_string(),
     };
 
@@ -135,6 +139,8 @@ async fn get_video_info(path: String) -> Result<VideoInfo, String> {
                     video_info.audio_codec =
                         s["codec_name"].as_str().unwrap_or("unknown").to_string();
                     video_info.audio_bitrate = s["bit_rate"].as_str().unwrap_or("0").to_string();
+                    video_info.audio_sample_rate = s["sample_rate"].as_str().unwrap_or("0").to_string();
+                    video_info.audio_channels = s["channels"].as_str().unwrap_or("0").to_string();
                 }
                 _ => {}
             }
@@ -175,6 +181,8 @@ pub struct AudioSettings {
     stream: String,
     codec: String,
     bitrate: String,
+    sample_rate: String,
+    channels: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -270,6 +278,18 @@ async fn run_task(
             args.push(settings.audio.codec.clone());
             args.push("-b:a".to_string());
             args.push(settings.audio.bitrate.clone());
+
+            // Add sample rate if specified
+            if !settings.audio.sample_rate.is_empty() {
+                args.push("-ar".to_string());
+                args.push(settings.audio.sample_rate.clone());
+            }
+
+            // Add channels if specified
+            if !settings.audio.channels.is_empty() {
+                args.push("-ac".to_string());
+                args.push(settings.audio.channels.clone());
+            }
         }
         _ => {}
     }
