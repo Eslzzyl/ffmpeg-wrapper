@@ -39,13 +39,40 @@ const settings = ref({
   },
   advanced: {
     resolution: 'original',
+    customWidth: 1920,
+    customHeight: 1080,
     trimStart: '',
     trimEnd: ''
   },
   output: {
-    dir: '',
+    dir: 'original',
     suffix: '_out'
   }
+});
+
+const previewOutputName = computed(() => {
+  if (!selectedTask.value) {
+    return '请选择一个任务';
+  }
+
+  const task = selectedTask.value;
+  // 提取文件名和扩展名
+  const lastSlashIndex = task.path.lastIndexOf('/');
+  const lastBackslashIndex = task.path.lastIndexOf('\\');
+  const lastSeparatorIndex = Math.max(lastSlashIndex, lastBackslashIndex);
+  const fileName = task.path.substring(lastSeparatorIndex + 1);
+
+  const lastDotIndex = fileName.lastIndexOf('.');
+  let name, ext;
+  if (lastDotIndex === -1) {
+    name = fileName;
+    ext = '';
+  } else {
+    name = fileName.substring(0, lastDotIndex);
+    ext = fileName.substring(lastDotIndex);
+  }
+
+  return `${name}${settings.value.output.suffix}${ext}`;
 });
 
 const formatSize = (bytes) => {
@@ -192,6 +219,8 @@ const startAll = async () => {
           audio: { ...settings.value.audio },
           advanced: {
             resolution: settings.value.advanced.resolution,
+            custom_width: parseInt(settings.value.advanced.customWidth) || 1920,
+            custom_height: parseInt(settings.value.advanced.customHeight) || 1080,
             trim_start: settings.value.advanced.trimStart,
             trim_end: settings.value.advanced.trimEnd
           },
@@ -367,7 +396,17 @@ const removeTask = (id) => {
               <option value="1920:1080">1920x1080 (1080p)</option>
               <option value="1280:720">1280x720 (720p)</option>
               <option value="854:480">854x480 (480p)</option>
+              <option value="custom">自定义分辨率</option>
             </select>
+          </div>
+
+          <div class="form-item" v-if="settings.advanced.resolution === 'custom'">
+            <label>自定义分辨率</label>
+            <div class="input-with-btn">
+              <input type="number" v-model="settings.advanced.customWidth" placeholder="宽度" min="1" />
+              <span>×</span>
+              <input type="number" v-model="settings.advanced.customHeight" placeholder="高度" min="1" />
+            </div>
           </div>
           <div class="form-item">
             <label>裁剪 (Trim)</label>
@@ -382,14 +421,22 @@ const removeTask = (id) => {
         <div v-if="activeTab === 'output'" class="config-section">
           <div class="form-item">
             <label>输出目录</label>
-            <div class="input-with-btn">
-              <input type="text" v-model="settings.output.dir" placeholder="默认：原文件夹/out">
+            <select v-model="settings.output.dir">
+              <option value="original">原文件夹</option>
+              <option value="">自定义目录</option>
+            </select>
+            <div v-if="settings.output.dir !== 'original'" class="input-with-btn" style="margin-top: 8px;">
+              <input type="text" v-model="settings.output.dir" placeholder="选择输出目录">
               <button @click="selectOutputDir">选择</button>
             </div>
           </div>
           <div class="form-item">
             <label>文件名后缀</label>
             <input type="text" v-model="settings.output.suffix">
+          </div>
+          <div class="form-item">
+            <label>预览输出文件名</label>
+            <div class="preview-output">{{ previewOutputName }}</div>
           </div>
         </div>
       </div>
@@ -399,7 +446,12 @@ const removeTask = (id) => {
     <div class="bottom-bar">
       <div class="status-info">
         <span class="status-dot" :class="{ ready: ffmpegStatus.includes('Ready') }"></span>
-        FFmpeg: {{ ffmpegStatus }} | GPU Accel: {{ gpuAccel ? 'On' : 'Off' }}
+        FFmpeg: {{ ffmpegStatus }} | GPU:
+        <span v-if="gpuInfo.has_nvenc" class="gpu-tag">NVIDIA</span>
+        <span v-if="gpuInfo.has_videotoolbox" class="gpu-tag">Apple</span>
+        <span v-if="gpuInfo.has_amf" class="gpu-tag">AMD</span>
+        <span v-if="gpuInfo.has_qsv" class="gpu-tag">Intel</span>
+        <span v-if="!gpuInfo.has_nvenc && !gpuInfo.has_videotoolbox && !gpuInfo.has_amf && !gpuInfo.has_qsv" class="gpu-tag-none">None</span>
       </div>
       <div class="global-progress">
         <div class="progress-text">总进度: {{ globalProgress }}%</div>
@@ -867,6 +919,37 @@ button {
   font-size: 18px;
   cursor: pointer;
   color: var(--text-secondary);
+}
+
+.gpu-tag {
+  display: inline-block;
+  padding: 2px 6px;
+  margin: 0 3px;
+  border-radius: 4px;
+  background-color: #4cd964;
+  color: white;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.gpu-tag-none {
+  display: inline-block;
+  padding: 2px 6px;
+  margin: 0 3px;
+  border-radius: 4px;
+  background-color: #ff3b30;
+  color: white;
+  font-size: 11px;
+  font-weight: bold;
+}
+
+.preview-output {
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background-color: #f9f9f9;
+  font-family: monospace;
+  word-break: break-all;
 }
 
 .modal-body {

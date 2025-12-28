@@ -180,6 +180,8 @@ pub struct AudioSettings {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AdvancedSettings {
     resolution: String,
+    custom_width: i32,
+    custom_height: i32,
     trim_start: String,
     trim_end: String,
 }
@@ -275,7 +277,12 @@ async fn run_task(
     // Advanced settings
     if settings.advanced.resolution != "original" {
         args.push("-vf".to_string());
-        args.push(format!("scale={}", settings.advanced.resolution));
+        let scale_filter = if settings.advanced.resolution == "custom" {
+            format!("scale={}:{}", settings.advanced.custom_width, settings.advanced.custom_height)
+        } else {
+            format!("scale={}", settings.advanced.resolution)
+        };
+        args.push(scale_filter);
     }
 
     if !settings.advanced.trim_start.is_empty() {
@@ -289,7 +296,7 @@ async fn run_task(
 
     // Output path
     let input_file = std::path::Path::new(&input_path);
-    let parent = if settings.output.dir.is_empty() {
+    let parent = if settings.output.dir.is_empty() || settings.output.dir == "original" {
         input_file
             .parent()
             .unwrap_or_else(|| std::path::Path::new(""))
